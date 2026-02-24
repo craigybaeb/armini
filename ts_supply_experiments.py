@@ -204,7 +204,7 @@ def train_eval_gbm(train_df,test_df,cfg):
         for it in cfg.gbm_grid['max_iter']:
             for mln in cfg.gbm_grid['max_leaf_nodes']:
                 m=HistGradientBoostingRegressor(learning_rate=lr,max_iter=it,max_leaf_nodes=mln,early_stopping=True,validation_fraction=0.1,random_state=42)
-                m.fit(Xtr[tr],ytr[tr]); rmse=mean_squared_error(ytr[va], m.predict(Xtr[va]), squared=False)
+                m.fit(Xtr[tr],ytr[tr]); rmse=np.sqrt(mean_squared_error(ytr[va], m.predict(Xtr[va])))
                 if rmse<br: br,best,bm=rmse, {"learning_rate":lr,"max_iter":it,"max_leaf_nodes":mln}, m
     bm.fit(Xtr,ytr); yhat=bm.predict(Xte)
     return pd.Series(yhat,index=test_df['time_stamp']), {"best_params":best,"n_features":Xtr.shape[1],"model":bm,"feature_cols":feats,"exog":exog}
@@ -217,7 +217,7 @@ def train_eval_knn(train_df,test_df,cfg):
     best=None; br=np.inf; bm=None
     for k in cfg.knn_grid['n_neighbors']:
         for w in cfg.knn_grid['weights']:
-            m=KNeighborsRegressor(n_neighbors=k,weights=w); m.fit(Xtr_s[tr],ytr[tr]); rmse=mean_squared_error(ytr[va],m.predict(Xtr_s[va]),squared=False)
+            m=KNeighborsRegressor(n_neighbors=k,weights=w); m.fit(Xtr_s[tr],ytr[tr]); rmse=np.sqrt(mean_squared_error(ytr[va],m.predict(Xtr_s[va])))
             if rmse<br: br,best,bm=rmse,{"n_neighbors":k,"weights":w},m
     bm.fit(Xtr_s,ytr); yhat=bm.predict(Xte_s)
     return pd.Series(yhat,index=test_df['time_stamp']), {"best_params":best,"scaler":sc,"model":bm,"feature_cols":feats,"exog":exog}
