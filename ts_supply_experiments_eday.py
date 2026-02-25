@@ -62,6 +62,7 @@ class Config:
     reset_tz: str = "Europe/London"
     synth_start: Optional[str] = None
     synth_freq: Optional[str] = None
+    debug_visualize: bool = False  # Enable debug visualizations
 
     def __post_init__(self):
         if self.gbm_grid is None: self.gbm_grid={"learning_rate":[0.05,0.1],"max_iter":[300,600],"max_leaf_nodes":[31,63]}
@@ -124,26 +125,60 @@ def detect_time_and_target(df,cfg):
     return tcol,ycol
 
 def load_supply(csv_path,cfg):
-    df=read_csv_robust(csv_path, cfg.on_bad_lines)
+    print(f"📂 Loading CSV: {csv_path}")
+    try:
+        df=read_csv_robust(csv_path, cfg.on_bad_lines)
+        print(f"✅ CSV loaded successfully: {df.shape} (rows × columns)")
+    except Exception as e:
+        print(f"❌ Error loading CSV: {e}")
+        print("🔧 Trying alternative parsing...")
+        try:
+            df = pd.read_csv(csv_path, on_bad_lines='skip')
+            print(f"✅ CSV loaded with bad lines skipped: {df.shape}")
+        except Exception as e2:
+            print(f"❌ Alternative parsing also failed: {e2}")
+            raise e2
+    
     tcol,ycol=detect_time_and_target(df,cfg)
+    print(f"🎯 Detected time column: {tcol}")  
+    print(f"🎯 Detected target column: {ycol}")
+    
     # Timestamp handling
     if tcol is None and cfg.synth_start:
         # Synthesize a timestamp column
         n=len(df)
         ts = pd.date_range(start=cfg.synth_start, periods=n, freq=(cfg.synth_freq or "30S"), tz=cfg.reset_tz)
         df.insert(0, "time_stamp", ts.tz_convert("UTC"))
+        print(f"🕒 Synthesized timestamps from {cfg.synth_start}")
     else:
+        if tcol is None:
+            raise ValueError("No time column detected and no synthesis parameters provided. Use --synthesize_time_start")
         df[tcol]=pd.to_datetime(df[tcol],errors='coerce',utc=True)
         df=df.rename(columns={tcol:"time_stamp"})
+        print(f"🕒 Parsed time column: {tcol}")
+    
     # Target handling
     if ycol is not None and ycol in df.columns:
         df=df.rename(columns={ycol:"target"})
+        print(f"🎯 Using target column: {ycol}")
     elif ycol is not None:
         df["target"]=pd.to_numeric(df[ycol], errors="coerce")  # safety
+        print(f"🎯 Converted target column: {ycol}")
+    else:
+        raise ValueError("No target column detected. Check your data or specify --target_col")
+    
     # Keep numeric features as potential exogenous (optional)
     num_cols=df.select_dtypes(include=[np.number]).columns.tolist()
     keep=["time_stamp"]+list(dict.fromkeys(["target"]+[c for c in num_cols if c!="target"]))
+    initial_rows = len(df)
     df=df[keep].dropna(subset=["time_stamp"]).sort_values("time_stamp").reset_index(drop=True)
+    final_rows = len(df)
+    
+    print(f"📊 Data cleaning: {initial_rows:,} → {final_rows:,} rows ({final_rows/initial_rows*100:.1f}% retained)")
+    if 'target' in df.columns and not df['target'].empty:
+        target_stats = df['target'].dropna()
+        print(f"📈 Target preview: mean={target_stats.mean():.2f}, range=[{target_stats.min():.2f}, {target_stats.max():.2f}]")
+    
     return df,ycol
 
 def hourly_from_eday_last_diff(df: pd.DataFrame, reset_tz: str="Europe/London") -> pd.DataFrame:
@@ -198,6 +233,144 @@ def add_lag_roll(df,lags,rolls):
         g[f"target_roll_mean_{W}"]=g["target"].rolling(W,min_periods=max(1,W//2)).mean()
         g[f"target_roll_std_{W}"]=g["target"].rolling(W,min_periods=max(1,W//2)).std()
     g=add_time_features(g); return g.dropna().reset_index(drop=True)
+
+def visualize_data_pipeline(raw_df, processed_df, stage_name, cfg, detected_target=None):
+    """
+    Visualize E-day data at different processing stages to debug scaling issues.
+    This helps identify where the 828 → 7 scaling problem occurs.
+    """
+    print(f"\n🔍 === DATA ANALYSIS: {stage_name.upper()} ===")
+    
+    # Analyze raw data
+    if 'target' in raw_df.columns:
+        target_data = raw_df['target'].dropna()
+        print(f"📊 Raw {stage_name} Statistics:")
+        print(f"   Count: {len(target_data):,}")
+        print(f"   Mean:  {target_data.mean():.2f}")
+        print(f"   Std:   {target_data.std():.2f}")
+        print(f"   Min:   {target_data.min():.2f}")
+        print(f"   Max:   {target_data.max():.2f}")
+        print(f"   25%:   {target_data.quantile(0.25):.2f}")
+        print(f"   50%:   {target_data.quantile(0.50):.2f}")  
+        print(f"   75%:   {target_data.quantile(0.75):.2f}")
+        
+        # Look for the infamous 828 value and 7 value
+        if target_data.mean() > 800 or target_data.max() > 800:
+            print(f"   🎯 FOUND HIGH VALUES! Mean={target_data.mean():.2f}, Max={target_data.max():.2f}")
+        if target_data.max() <= 10:
+            print(f"   ⚠️  SUSPICIOUSLY LOW VALUES! Max={target_data.max():.2f}")
+            
+        # Show value distribution
+        print(f"📈 Value Distribution:")
+        bins = [0, 1, 10, 100, 500, 1000, float('inf')]
+        bin_labels = ['0-1', '1-10', '10-100', '100-500', '500-1000', '1000+']
+        counts = pd.cut(target_data, bins=bins, labels=bin_labels).value_counts()
+        for label, count in counts.items():
+            if count > 0:
+                print(f"   {label:8s}: {count:6,} values ({count/len(target_data)*100:.1f}%)")
+    
+    # Time span analysis
+    if 'time_stamp' in raw_df.columns:
+        time_span = raw_df['time_stamp'].max() - raw_df['time_stamp'].min()
+        print(f"📅 Time Span: {time_span}")
+        print(f"   Start: {raw_df['time_stamp'].min()}")
+        print(f"   End:   {raw_df['time_stamp'].max()}")
+        print(f"   Rows:  {len(raw_df):,}")
+    
+    # Compare processed vs raw if different
+    if processed_df is not None and 'target' in processed_df.columns:
+        proc_target = processed_df['target'].dropna()
+        print(f"\n📊 Processed {stage_name} Statistics:")
+        print(f"   Count: {len(proc_target):,}")
+        print(f"   Mean:  {proc_target.mean():.2f}")
+        print(f"   Std:   {proc_target.std():.2f}")
+        print(f"   Min:   {proc_target.min():.2f}")
+        print(f"   Max:   {proc_target.max():.2f}")
+        
+        # Scaling factor analysis
+        if len(target_data) > 0 and len(proc_target) > 0:
+            raw_mean = target_data.mean()
+            proc_mean = proc_target.mean()
+            if raw_mean > 0 and proc_mean > 0:
+                scaling_factor = raw_mean / proc_mean
+                print(f"   🔍 SCALING FACTOR: {scaling_factor:.2f}x (raw_mean/proc_mean)")
+                if scaling_factor > 10 or scaling_factor < 0.1:
+                    print(f"   ⚠️  MAJOR SCALING DETECTED! Factor = {scaling_factor:.2f}x")
+    
+    # Create visualization files
+    try:
+        plots_dir = os.path.join(cfg.out_dir, "plots")
+        ensure_dir(plots_dir)
+        
+        # Plot raw data time series
+        if 'target' in raw_df.columns and 'time_stamp' in raw_df.columns:
+            fig = go.Figure()
+            sample_data = raw_df.sample(min(10000, len(raw_df))).sort_values('time_stamp')
+            fig.add_trace(go.Scatter(
+                x=sample_data['time_stamp'], 
+                y=sample_data['target'],
+                mode='lines+markers' if len(sample_data) < 100 else 'lines',
+                name=f'Raw {stage_name}',
+                line=dict(color='blue')
+            ))
+            
+            if processed_df is not None and 'target' in processed_df.columns:
+                proc_sample = processed_df.sample(min(5000, len(processed_df))).sort_values('time_stamp')
+                fig.add_trace(go.Scatter(
+                    x=proc_sample['time_stamp'],
+                    y=proc_sample['target'], 
+                    mode='lines+markers' if len(proc_sample) < 100 else 'lines',
+                    name=f'Processed {stage_name}',
+                    line=dict(color='red')
+                ))
+            
+            fig.update_layout(
+                title=f'E-day Data Analysis: {stage_name}',
+                xaxis_title='Time',
+                yaxis_title='Target Value',
+                width=1200, height=600
+            )
+            
+            filename = f"debug_{stage_name.lower().replace(' ', '_')}_timeseries.html"
+            fig.write_html(os.path.join(plots_dir, filename))
+            print(f"💾 Saved plot: {filename}")
+        
+        # Plot distribution histogram  
+        if 'target' in raw_df.columns:
+            fig2 = go.Figure()
+            
+            # Raw data histogram
+            fig2.add_trace(go.Histogram(
+                x=target_data,
+                name=f'Raw {stage_name}',
+                opacity=0.7,
+                nbinsx=50
+            ))
+            
+            if processed_df is not None and 'target' in processed_df.columns:
+                fig2.add_trace(go.Histogram(
+                    x=processed_df['target'].dropna(),
+                    name=f'Processed {stage_name}',
+                    opacity=0.7,
+                    nbinsx=50
+                ))
+            
+            fig2.update_layout(
+                title=f'Value Distribution: {stage_name}',
+                xaxis_title='Target Value',
+                yaxis_title='Frequency', 
+                barmode='overlay',
+                width=1200, height=600
+            )
+            
+            filename = f"debug_{stage_name.lower().replace(' ', '_')}_distribution.html"
+            fig2.write_html(os.path.join(plots_dir, filename))
+            print(f"💾 Saved plot: {filename}")
+            
+    except Exception as e:
+        print(f"⚠️  Plot generation failed: {e}")
+    
+    print("=" * 60)
 
 def build_train_test(df,frac): c=time_split_cutoff(df,"time_stamp",frac); return df[df["time_stamp"]<=c].copy(), df[df["time_stamp"]>c].copy(), c
 
@@ -369,29 +542,56 @@ def main():
     ap.add_argument("--reset_tz",default="Europe/London",help="Timezone for daily/hourly boundaries")
     ap.add_argument("--synthesize_time_start",dest="synth_start",default=None,help="If provided, synthesize a timestamp starting here (e.g., '2023-01-01 00:00:00')")
     ap.add_argument("--synthesize_time_freq",dest="synth_freq",default=None,help="Frequency for synthesized timestamps (e.g., '30S')")
+    ap.add_argument("--debug_visualize",action="store_true",help="Enable detailed debug visualizations to track data processing steps")
     args=ap.parse_args()
 
     cfg=Config(csv_path=args.csv_path,out_dir=args.out_dir,resample_rule=args.resample_rule,
                time_col=args.time_col,target_col=args.target_col,on_bad_lines=args.on_bad_lines,
-               e_day_mode=args.e_day_mode, reset_tz=args.reset_tz, synth_start=args.synth_start, synth_freq=args.synth_freq)
+               e_day_mode=args.e_day_mode, reset_tz=args.reset_tz, synth_start=args.synth_start, synth_freq=args.synth_freq,
+               debug_visualize=args.debug_visualize)
 
     ensure_dir(cfg.out_dir); ensure_dir(os.path.join(cfg.out_dir,"plots")); ensure_dir(os.path.join(cfg.out_dir,"models")); ensure_dir(os.path.join(cfg.out_dir,"predictions"))
     print("[1/7] Load"); raw, detected_target = load_supply(cfg.csv_path,cfg); print("Detected target:", detected_target or "(none)")
+    
+    # 🔍 VISUALIZATION: Raw loaded data  
+    if cfg.debug_visualize:
+        visualize_data_pipeline(raw, None, "Raw Loaded Data", cfg, detected_target)
+    
     # Ensure tz-aware UTC
     raw["time_stamp"] = pd.to_datetime(raw["time_stamp"], utc=True)
 
     print("[2/7] E-day conversion mode:", cfg.e_day_mode)
     if cfg.e_day_mode == "last_diff":
         rs = hourly_from_eday_last_diff(raw, reset_tz=cfg.reset_tz)
+        # 🔍 VISUALIZATION: After E-day last_diff conversion
+        if cfg.debug_visualize:
+            visualize_data_pipeline(raw, rs, "After E-day Last Diff", cfg, detected_target)
     elif cfg.e_day_mode == "diff_then_sum":
-        raw = convert_daily_resets_to_flow(raw, target_col="target", reset_tz=cfg.reset_tz)
-        rs = resample_hourly_sum_target(raw, cfg.resample_rule, cfg.max_interp_minutes)
+        raw_converted = convert_daily_resets_to_flow(raw, target_col="target", reset_tz=cfg.reset_tz)
+        # 🔍 VISUALIZATION: After daily reset conversion
+        if cfg.debug_visualize:
+            visualize_data_pipeline(raw, raw_converted, "After Daily Reset Conversion", cfg, detected_target)
+        rs = resample_hourly_sum_target(raw_converted, cfg.resample_rule, cfg.max_interp_minutes)
+        # 🔍 VISUALIZATION: After hourly resampling  
+        if cfg.debug_visualize:
+            visualize_data_pipeline(raw_converted, rs, "After Hourly Resampling", cfg, detected_target)
     else:
         # off -> assume target already per-interval; just hourly sum
         rs = resample_hourly_sum_target(raw, cfg.resample_rule, cfg.max_interp_minutes)
+        # 🔍 VISUALIZATION: After direct resampling (no E-day conversion)
+        if cfg.debug_visualize:
+            visualize_data_pipeline(raw, rs, "After Direct Resampling", cfg, detected_target)
 
     print("[3/7] Remove outage window"); rs = remove_blackouts(rs, cfg.blackout_ranges)
+    # 🔍 VISUALIZATION: After blackout removal
+    if cfg.debug_visualize:
+        rs_before_blackout = rs.copy()  # Store reference for comparison
+        visualize_data_pipeline(rs_before_blackout, rs, "After Blackout Removal", cfg, detected_target)
+    
     print("[4/7] Time features + FE"); rs = add_time_features(rs); fe = add_lag_roll(rs, cfg.lags, cfg.roll_windows)
+    # 🔍 VISUALIZATION: After feature engineering  
+    if cfg.debug_visualize:
+        visualize_data_pipeline(rs, fe, "After Feature Engineering", cfg, detected_target)
     print("[5/7] Split"); train_df, test_df, cutoff = build_train_test(fe, cfg.test_fraction_time); print("Cutoff:", cutoff)
     y_true = test_df.set_index("time_stamp")["target"].sort_index()
     print("[6/7] Baselines"); steps_daily = steps_for_period(cfg.resample_rule,"1D"); naive_last=forecast_naive_last_agg(test_df,train_df); naive_seas=forecast_naive_seasonal_agg(test_df,train_df,steps_daily)
