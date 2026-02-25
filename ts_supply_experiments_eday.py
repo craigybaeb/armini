@@ -827,8 +827,27 @@ def main():
     # Add full actual data
     fig2.add_trace(go.Scatter(x=full_data["time_stamp"],y=full_data["target"],mode="lines",name="Actual (Full Dataset)", line=dict(color='black', width=2)))
     
-    # Add train/test boundary
-    fig2.add_vline(x=cutoff, line_dash="dash", line_color="red", annotation_text=f"Train/Test Split ({cutoff.strftime('%m/%d')})")
+    # Add train/test boundary (convert timestamp to string to avoid Plotly issues)
+    try:
+        cutoff_str = pd.to_datetime(cutoff).strftime('%Y-%m-%d %H:%M:%S')
+        fig2.add_vline(x=cutoff_str, line_dash="dash", line_color="red", annotation_text=f"Train/Test Split ({cutoff.strftime('%m/%d')})")
+    except:
+        # Alternative approach using shapes if add_vline fails
+        fig2.add_shape(
+            type="line",
+            x0=cutoff, x1=cutoff,
+            y0=0, y1=1,
+            yref="paper",
+            line=dict(color="red", width=2, dash="dash")
+        )
+        fig2.add_annotation(
+            x=cutoff,
+            y=full_data["target"].max() * 0.9,
+            text=f"Train/Test Split ({cutoff.strftime('%m/%d')})",
+            showarrow=True,
+            arrowhead=2,
+            arrowcolor="red"
+        )
     
     # Add predictions (test period only)
     for i, k in enumerate(preds.keys()): 
