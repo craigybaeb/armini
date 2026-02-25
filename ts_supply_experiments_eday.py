@@ -58,11 +58,12 @@ class Config:
     transformer_epochs: int = 30
     transformer_patience: int = 5
     # E-day specifics
-    e_day_mode: str = "last_diff"    # 'off'|'last_diff'|'diff_then_sum'
+    e_day_mode: str = "last_diff"    # 'off'|'last_diff'|'diff_then_sum'|'scaled'
     reset_tz: str = "Europe/London"
     synth_start: Optional[str] = None
     synth_freq: Optional[str] = None
     debug_visualize: bool = False  # Enable debug visualizations
+    skip_blackouts: bool = False   # Skip blackout removal
 
     def __post_init__(self):
         if self.gbm_grid is None: self.gbm_grid={"learning_rate":[0.05,0.1],"max_iter":[300,600],"max_leaf_nodes":[31,63]}
@@ -181,15 +182,176 @@ def load_supply(csv_path,cfg):
     
     return df,ycol
 
-def hourly_from_eday_last_diff(df: pd.DataFrame, reset_tz: str="Europe/London") -> pd.DataFrame:
+def analyze_eday_pattern(df: pd.DataFrame, reset_tz: str="Europe/London") -> None:
+    """
+    Analyze the E-day data pattern to understand if it's:
+    1. Continuously cumulative (increases forever)
+    2. Daily cumulative (resets each day) 
+    3. Already hourly generation values
+    """
+    print(f"\n🔍 === E-DAY PATTERN ANALYSIS ===")
+    
+    # Convert to local time for daily analysis
+    df_local = df.copy()
+    df_local['time_local'] = pd.to_datetime(df_local['time_stamp']).dt.tz_convert(reset_tz)
+    df_local['date'] = df_local['time_local'].dt.date
+    df_local['hour'] = df_local['time_local'].dt.hour
+    
+    # Daily statistics
+    daily_stats = df_local.groupby('date')['target'].agg(['min', 'max', 'mean', 'std']).reset_index()
+    daily_stats['daily_range'] = daily_stats['max'] - daily_stats['min']
+    
+    print(f"📅 Daily Pattern Analysis:")
+    print(f"   Total days: {len(daily_stats)}")
+    print(f"   Avg daily min: {daily_stats['min'].mean():.2f}")
+    print(f"   Avg daily max: {daily_stats['max'].mean():.2f}")
+    print(f"   Avg daily range: {daily_stats['daily_range'].mean():.2f}")
+    
+    # Check for daily resets (min values close to 0)
+    low_mins = (daily_stats['min'] < 100).sum()
+    print(f"   Days with min < 100: {low_mins}/{len(daily_stats)} ({low_mins/len(daily_stats)*100:.1f}%)")
+    
+    # Check if values continuously increase
+    is_monotonic = df['target'].is_monotonic_increasing
+    print(f"   Continuously increasing: {is_monotonic}")
+    
+    # Sample daily patterns
+    print(f"\n📊 Sample Daily Patterns (first 3 days):")
+    for i, date in enumerate(daily_stats['date'].head(3)):
+        day_data = df_local[df_local['date'] == date]['target']
+        print(f"   {date}: {day_data.min():.1f} → {day_data.max():.1f} (range: {day_data.max()-day_data.min():.1f})")
+    
+    # Hourly difference analysis
+    diffs = df['target'].diff().dropna()
+    positive_diffs = diffs[diffs > 0]
+    negative_diffs = diffs[diffs < 0]
+    
+    print(f"\n📈 Difference Analysis:")
+    print(f"   Positive diffs: {len(positive_diffs)} ({len(positive_diffs)/len(diffs)*100:.1f}%)")
+    print(f"   Negative diffs: {len(negative_diffs)} ({len(negative_diffs)/len(diffs)*100:.1f}%)")
+    print(f"   Avg positive diff: {positive_diffs.mean():.2f}")
+    print(f"   Avg negative diff: {negative_diffs.mean():.2f}")
+    
+    # Recommend conversion method
+    print(f"\n💡 RECOMMENDED E-DAY MODE:")
+    if low_mins/len(daily_stats) > 0.5:
+        print(f"   → 'diff_then_sum' (daily cumulative data that resets)")
+        print(f"     Your data appears to reset daily (many days start near 0)")
+    elif is_monotonic and len(negative_diffs) < len(diffs) * 0.1:
+        print(f"   → 'last_diff' (continuously cumulative data)")  
+        print(f"     Your data appears to continuously accumulate")
+    else:
+        print(f"   → 'off' (already hourly generation values)")
+        print(f"     Your data might already be in the right format")
+    
+    print("=" * 60)
+
+def hourly_from_eday_scaled(df: pd.DataFrame, reset_tz: str="Europe/London") -> pd.DataFrame:
+    """
+    Alternative E-day conversion that preserves the original scale.
+    Assumes data might be already in correct hourly format or need minimal processing.
+    """
+    print(f"🔄 E-day scaled conversion: {len(df)} rows input ({df['time_stamp'].min()} to {df['time_stamp'].max()})")
+    
+    g = df.copy().set_index("time_stamp").sort_index()
+    g = g.tz_convert(reset_tz)
+    
+    # Try different approaches
+    # Approach 1: Direct hourly resampling (sum instead of last+diff)
+    hourly_sum = g["target"].resample("1H").sum()
+    print(f"   Hourly sum approach: mean={hourly_sum.mean():.2f}, max={hourly_sum.max():.2f}")
+    
+    # Approach 2: Hourly mean
+    hourly_mean = g["target"].resample("1H").mean()  
+    print(f"   Hourly mean approach: mean={hourly_mean.mean():.2f}, max={hourly_mean.max():.2f}")
+    
+    # Approach 3: Take last value but don't diff (assume already incremental)
+    hourly_last = g["target"].resample("1H").last()
+    print(f"   Hourly last (no diff): mean={hourly_last.mean():.2f}, max={hourly_last.max():.2f}")
+    
+    # Choose the approach that preserves reasonable scale (closest to original mean)
+    original_mean = df['target'].mean()
+    approaches = {
+        'sum': hourly_sum,
+        'mean': hourly_mean, 
+        'last_no_diff': hourly_last
+    }
+    
+    best_approach = None
+    best_diff = float('inf')
+    
+    for name, series in approaches.items():
+        if len(series.dropna()) > 0:
+            mean_diff = abs(series.mean() - original_mean)
+            print(f"   {name}: mean_diff from original = {mean_diff:.2f}")
+            if mean_diff < best_diff:
+                best_diff = mean_diff
+                best_approach = name
+                
+    print(f"   Selected approach: {best_approach}")
+    
+    result = approaches[best_approach].dropna()
+    out = pd.DataFrame({"target": result})
+    out.index = out.index.tz_convert("UTC")
+    out = out.reset_index().rename(columns={"index":"time_stamp"})
+    
+    print(f"   Final output: {len(out)} rows ({out['time_stamp'].min()} to {out['time_stamp'].max()})")
+    print(f"   Value stats: mean={out['target'].mean():.2f}, range=[{out['target'].min():.2f}, {out['target'].max():.2f}]")
+    
+    return out
+    print(f"🔄 E-day conversion: {len(df)} rows input ({df['time_stamp'].min()} to {df['time_stamp'].max()})")
+    
     g=df.copy().set_index("time_stamp").sort_index()
+    print(f"   After indexing: {len(g)} rows ({g.index.min()} to {g.index.max()})")
+    
     # Work in local time to align the hourly boundary
     g = g.tz_convert(reset_tz)
+    print(f"   After timezone convert to {reset_tz}: {len(g)} rows ({g.index.min()} to {g.index.max()})")
+    
     hourly_last = g["target"].resample("1H").last()
+    print(f"   After hourly resample (last): {len(hourly_last)} rows ({hourly_last.index.min()} to {hourly_last.index.max()})")
+    print(f"   Non-null values: {hourly_last.notna().sum()}")
+    
     hourly_inc = hourly_last.diff().clip(lower=0)
+    print(f"   After diff + clipping: {len(hourly_inc)} rows, non-null: {hourly_inc.notna().sum()}")
+    
     out = pd.DataFrame({"target": hourly_inc}).dropna()
+    print(f"   After dropna: {len(out)} rows ({out.index.min()} to {out.index.max()})")
+    
     out.index = out.index.tz_convert("UTC")
     out = out.reset_index().rename(columns={"index":"time_stamp", "time_stamp":"time_stamp"})
+    
+    print(f"   Final output: {len(out)} rows ({out['time_stamp'].min()} to {out['time_stamp'].max()})")
+    print(f"   Value stats: mean={out['target'].mean():.2f}, range=[{out['target'].min():.2f}, {out['target'].max():.2f}]")
+    
+    return out
+
+def hourly_from_eday_last_diff(df: pd.DataFrame, reset_tz: str="Europe/London") -> pd.DataFrame:
+    print(f"🔄 E-day last_diff conversion: {len(df)} rows input ({df['time_stamp'].min()} to {df['time_stamp'].max()})")
+    
+    g=df.copy().set_index("time_stamp").sort_index()
+    print(f"   After indexing: {len(g)} rows ({g.index.min()} to {g.index.max()})")
+    
+    # Work in local time to align the hourly boundary
+    g = g.tz_convert(reset_tz)
+    print(f"   After timezone convert to {reset_tz}: {len(g)} rows ({g.index.min()} to {g.index.max()})")
+    
+    hourly_last = g["target"].resample("1H").last()
+    print(f"   After hourly resample (last): {len(hourly_last)} rows ({hourly_last.index.min()} to {hourly_last.index.max()})")
+    print(f"   Non-null values: {hourly_last.notna().sum()}")
+    
+    hourly_inc = hourly_last.diff().clip(lower=0)
+    print(f"   After diff + clipping: {len(hourly_inc)} rows, non-null: {hourly_inc.notna().sum()}")
+    
+    out = pd.DataFrame({"target": hourly_inc}).dropna()
+    print(f"   After dropna: {len(out)} rows ({out.index.min()} to {out.index.max()})")
+    
+    out.index = out.index.tz_convert("UTC")
+    out = out.reset_index().rename(columns={"index":"time_stamp", "time_stamp":"time_stamp"})
+    
+    print(f"   Final output: {len(out)} rows ({out['time_stamp'].min()} to {out['time_stamp'].max()})")
+    print(f"   Value stats: mean={out['target'].mean():.2f}, range=[{out['target'].min():.2f}, {out['target'].max():.2f}]")
+    
     return out
 
 def convert_daily_resets_to_flow(df: pd.DataFrame, target_col: str = "target", reset_tz: str = "Europe/London") -> pd.DataFrame:
@@ -538,20 +700,24 @@ def main():
     ap.add_argument("--target_col",default=None)
     ap.add_argument("--on_bad_lines",default="skip",choices=["skip","warn","error"])
     ap.add_argument("--resample_rule",default="1H")
-    ap.add_argument("--e_day_mode",default="last_diff",choices=["off","last_diff","diff_then_sum"], help="How to convert E-day cumulative values to hourly increments.")
+    ap.add_argument("--e_day_mode",default="last_diff",choices=["off","last_diff","diff_then_sum","scaled"], help="How to convert E-day cumulative values to hourly increments.")
     ap.add_argument("--reset_tz",default="Europe/London",help="Timezone for daily/hourly boundaries")
     ap.add_argument("--synthesize_time_start",dest="synth_start",default=None,help="If provided, synthesize a timestamp starting here (e.g., '2023-01-01 00:00:00')")
     ap.add_argument("--synthesize_time_freq",dest="synth_freq",default=None,help="Frequency for synthesized timestamps (e.g., '30S')")
     ap.add_argument("--debug_visualize",action="store_true",help="Enable detailed debug visualizations to track data processing steps")
+    ap.add_argument("--skip_blackouts",action="store_true",help="Skip blackout removal (useful when blackout dates don't apply to your data)")
     args=ap.parse_args()
 
     cfg=Config(csv_path=args.csv_path,out_dir=args.out_dir,resample_rule=args.resample_rule,
                time_col=args.time_col,target_col=args.target_col,on_bad_lines=args.on_bad_lines,
                e_day_mode=args.e_day_mode, reset_tz=args.reset_tz, synth_start=args.synth_start, synth_freq=args.synth_freq,
-               debug_visualize=args.debug_visualize)
+               debug_visualize=args.debug_visualize, skip_blackouts=args.skip_blackouts)
 
     ensure_dir(cfg.out_dir); ensure_dir(os.path.join(cfg.out_dir,"plots")); ensure_dir(os.path.join(cfg.out_dir,"models")); ensure_dir(os.path.join(cfg.out_dir,"predictions"))
-    print("[1/7] Load"); raw, detected_target = load_supply(cfg.csv_path,cfg); print("Detected target:", detected_target or "(none)")
+    print("[1/7] Load"); raw_original, detected_target = load_supply(cfg.csv_path,cfg); print("Detected target:", detected_target or "(none)")
+    
+    # Keep reference to original data for comparison
+    raw = raw_original.copy()
     
     # 🔍 VISUALIZATION: Raw loaded data  
     if cfg.debug_visualize:
@@ -560,12 +726,20 @@ def main():
     # Ensure tz-aware UTC
     raw["time_stamp"] = pd.to_datetime(raw["time_stamp"], utc=True)
 
+    # 🔍 ANALYZE E-DAY PATTERN
+    analyze_eday_pattern(raw, cfg.reset_tz)
+
     print("[2/7] E-day conversion mode:", cfg.e_day_mode)
     if cfg.e_day_mode == "last_diff":
         rs = hourly_from_eday_last_diff(raw, reset_tz=cfg.reset_tz)
         # 🔍 VISUALIZATION: After E-day last_diff conversion
         if cfg.debug_visualize:
             visualize_data_pipeline(raw, rs, "After E-day Last Diff", cfg, detected_target)
+    elif cfg.e_day_mode == "scaled":
+        rs = hourly_from_eday_scaled(raw, reset_tz=cfg.reset_tz)
+        # 🔍 VISUALIZATION: After E-day scaled conversion
+        if cfg.debug_visualize:
+            visualize_data_pipeline(raw, rs, "After E-day Scaled", cfg, detected_target)
     elif cfg.e_day_mode == "diff_then_sum":
         raw_converted = convert_daily_resets_to_flow(raw, target_col="target", reset_tz=cfg.reset_tz)
         # 🔍 VISUALIZATION: After daily reset conversion
@@ -582,11 +756,15 @@ def main():
         if cfg.debug_visualize:
             visualize_data_pipeline(raw, rs, "After Direct Resampling", cfg, detected_target)
 
-    print("[3/7] Remove outage window"); rs = remove_blackouts(rs, cfg.blackout_ranges)
-    # 🔍 VISUALIZATION: After blackout removal
-    if cfg.debug_visualize:
-        rs_before_blackout = rs.copy()  # Store reference for comparison
-        visualize_data_pipeline(rs_before_blackout, rs, "After Blackout Removal", cfg, detected_target)
+    print("[3/7] Remove outage window")
+    if cfg.skip_blackouts:
+        print("   Skipping blackout removal (--skip_blackouts enabled)")
+    else:
+        rs = remove_blackouts(rs, cfg.blackout_ranges)
+        # 🔍 VISUALIZATION: After blackout removal
+        if cfg.debug_visualize:
+            rs_before_blackout = rs.copy()  # Store reference for comparison
+            visualize_data_pipeline(rs_before_blackout, rs, "After Blackout Removal", cfg, detected_target)
     
     print("[4/7] Time features + FE"); rs = add_time_features(rs); fe = add_lag_roll(rs, cfg.lags, cfg.roll_windows)
     # 🔍 VISUALIZATION: After feature engineering  
@@ -642,11 +820,26 @@ def main():
     try: fig.write_image(os.path.join(cfg.out_dir,"plots","supply_eday_model_comparison.png"),width=1200,height=500,scale=2)
     except Exception as e: print("[WARN] kaleido:",e)
 
-    fig2=go.Figure(); fig2.add_trace(go.Scatter(x=comb["time_stamp"],y=comb["y"],mode="lines",name="Actual"))
-    for k in preds.keys(): fig2.add_trace(go.Scatter(x=comb["time_stamp"],y=comb[f"yhat_{k}"],mode="lines",name=k))
-    fig2.update_layout(title="Supply (E-day) — Actual vs Predicted (Test)",xaxis_title="Time",yaxis_title="Target",width=1200,height=500)
-    fig2.write_html(os.path.join(cfg.out_dir,"plots","supply_eday_actual_vs_pred.html"))
-    try: fig2.write_image(os.path.join(cfg.out_dir,"plots","supply_eday_actual_vs_pred.png"),width=1200,height=500,scale=2)
+    # Plot FULL dataset (train + test) instead of just test period
+    full_data = pd.concat([train_df, test_df], ignore_index=True).sort_values('time_stamp')
+    fig2=go.Figure()
+    
+    # Add full actual data
+    fig2.add_trace(go.Scatter(x=full_data["time_stamp"],y=full_data["target"],mode="lines",name="Actual (Full Dataset)", line=dict(color='black', width=2)))
+    
+    # Add train/test boundary
+    fig2.add_vline(x=cutoff, line_dash="dash", line_color="red", annotation_text=f"Train/Test Split ({cutoff.strftime('%m/%d')})")
+    
+    # Add predictions (test period only)
+    for i, k in enumerate(preds.keys()): 
+        color_cycle = ['blue', 'green', 'orange', 'purple', 'brown']
+        color = color_cycle[i % len(color_cycle)]
+        pred_data = comb[comb['time_stamp'].isin(test_df['time_stamp'])]
+        fig2.add_trace(go.Scatter(x=pred_data["time_stamp"],y=pred_data[f"yhat_{k}"],mode="lines",name=f"{k} (Prediction)", line=dict(color=color)))
+    
+    fig2.update_layout(title=f"Supply (E-day) — Full Dataset Timeline | Original: {raw_original['time_stamp'].min().strftime('%m/%d')} - {raw_original['time_stamp'].max().strftime('%m/%d')} | Processed: {full_data['time_stamp'].min().strftime('%m/%d')} - {full_data['time_stamp'].max().strftime('%m/%d')}",xaxis_title="Time",yaxis_title="Target Value",width=1400,height=600)
+    fig2.write_html(os.path.join(cfg.out_dir,"plots","supply_eday_full_timeline.html"))
+    try: fig2.write_image(os.path.join(cfg.out_dir,"plots","supply_eday_full_timeline.png"),width=1400,height=600,scale=2)
     except Exception as e: print("[WARN] kaleido:",e)
 
     comb_err = comb.copy()
@@ -662,9 +855,24 @@ def main():
     open(os.path.join(cfg.out_dir,"experiment_manifest.json"),"w").write(json.dumps({
         "cutoff_time": str(cutoff),
         "detected_target": detected_target,
+        "original_data_span": f"{raw_original['time_stamp'].min()} to {raw_original['time_stamp'].max()}",
+        "processed_data_span": f"{pd.concat([train_df, test_df])['time_stamp'].min()} to {pd.concat([train_df, test_df])['time_stamp'].max()}",
+        "data_loss_analysis": {
+            "original_rows": len(raw_original),
+            "processed_rows": len(pd.concat([train_df, test_df])), 
+            "retention_rate": f"{len(pd.concat([train_df, test_df]))/len(raw_original)*100:.2f}%"
+        },
         "config": asdict(cfg),
         "models": list(preds.keys())
     }, indent=2))
+    
+    print(f"\n📊 DATA PROCESSING SUMMARY:")
+    print(f"   Original: {len(raw_original):,} rows ({raw_original['time_stamp'].min().strftime('%Y-%m-%d')} to {raw_original['time_stamp'].max().strftime('%Y-%m-%d')})")
+    processed_full = pd.concat([train_df, test_df])
+    print(f"   Processed: {len(processed_full):,} rows ({processed_full['time_stamp'].min().strftime('%Y-%m-%d')} to {processed_full['time_stamp'].max().strftime('%Y-%m-%d')})")
+    print(f"   Retention: {len(processed_full)/len(raw_original)*100:.1f}%")
+    print(f"   Train/Test Split: {len(train_df)}/{len(test_df)} rows")
+    
     print("Done. Outputs in:", cfg.out_dir)
 
 if __name__=="__main__":
